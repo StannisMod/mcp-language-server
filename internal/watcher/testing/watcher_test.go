@@ -94,7 +94,7 @@ func TestWatcherBasicFunctionality(t *testing.T) {
 		waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
 		defer waitCancel()
 
-		if !mockClient.WaitForEvent(waitCtx) {
+		if !mockClient.WaitForFileEvent(waitCtx, "file://"+filePath, protocol.FileChangeType(protocol.Created)) {
 			t.Logf("Events received so far: %+v", mockClient.GetEvents())
 			t.Fatal("Timed out waiting for file creation event")
 		}
@@ -125,7 +125,7 @@ func TestWatcherBasicFunctionality(t *testing.T) {
 		waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
 		defer waitCancel()
 
-		if !mockClient.WaitForEvent(waitCtx) {
+		if !mockClient.WaitForFileEvent(waitCtx, "file://"+filePath, protocol.FileChangeType(protocol.Changed)) {
 			t.Fatal("Timed out waiting for file modification event")
 		}
 
@@ -155,7 +155,7 @@ func TestWatcherBasicFunctionality(t *testing.T) {
 		waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
 		defer waitCancel()
 
-		if !mockClient.WaitForEvent(waitCtx) {
+		if !mockClient.WaitForFileEvent(waitCtx, "file://"+filePath, protocol.FileChangeType(protocol.Deleted)) {
 			t.Fatal("Timed out waiting for file deletion event")
 		}
 
@@ -322,7 +322,7 @@ func TestGitignoreIntegration(t *testing.T) {
 		waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
 		defer waitCancel()
 
-		if !mockClient.WaitForEvent(waitCtx) {
+		if !mockClient.WaitForFileEvent(waitCtx, "file://"+filePath, protocol.FileChangeType(protocol.Created)) {
 			t.Fatal("Timed out waiting for file creation event")
 		}
 

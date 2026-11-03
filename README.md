@@ -1,9 +1,13 @@
 # MCP Language Server
 
-[![Go Tests](https://github.com/isaacphi/mcp-language-server/actions/workflows/go.yml/badge.svg)](https://github.com/isaacphi/mcp-language-server/actions/workflows/go.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/isaacphi/mcp-language-server)](https://goreportcard.com/report/github.com/isaacphi/mcp-language-server)
-[![GoDoc](https://pkg.go.dev/badge/github.com/isaacphi/mcp-language-server)](https://pkg.go.dev/github.com/isaacphi/mcp-language-server)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/isaacphi/mcp-language-server)](https://github.com/isaacphi/mcp-language-server/blob/main/go.mod)
+> **StannisMod fork** of [isaacphi/mcp-language-server](https://github.com/isaacphi/mcp-language-server).
+> This fork adds fast, version-aware Pyright diagnostics, bounded concurrent MCP
+> tool dispatch, synchronized LSP writes, and regression tests. See
+> [Performance and correctness](PERFORMANCE.md) for behavior, checks, and benchmarks.
+> It is a third-party MCP-to-LSP bridge, not an official OpenCode component.
+
+[![Go Tests](https://github.com/StannisMod/mcp-language-server/actions/workflows/go.yml/badge.svg)](https://github.com/StannisMod/mcp-language-server/actions/workflows/go.yml)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/StannisMod/mcp-language-server)](https://github.com/StannisMod/mcp-language-server/blob/main/go.mod)
 
 This is an [MCP](https://modelcontextprotocol.io/introduction) server that runs and exposes a [language server](https://microsoft.github.io/language-server-protocol/) to LLMs. Not a language server for MCP, whatever that would be.
 
@@ -16,7 +20,17 @@ This is an [MCP](https://modelcontextprotocol.io/introduction) server that runs 
 ## Setup
 
 1. **Install Go**: Follow instructions at <https://golang.org/doc/install>
-2. **Install or update this server**: `go install github.com/isaacphi/mcp-language-server@latest`
+2. **Build this fork** (Go 1.24 or later):
+
+   ```sh
+   git clone https://github.com/StannisMod/mcp-language-server.git
+   cd mcp-language-server
+   go build -o mcp-language-server .
+   ```
+
+   Use the absolute path to that binary in your MCP client. The Go module path
+   remains the upstream path to keep internal imports and upstream merges simple;
+   installing the upstream module does **not** install this fork.
 3. **Install a language server**: _follow one of the guides below_
 4. **Configure your MCP client**: _follow one of the guides below_
 
@@ -193,7 +207,7 @@ Please keep PRs small and open Issues first for anything substantial. AI slop O.
 Clone the repo:
 
 ```bash
-git clone https://github.com/isaacphi/mcp-language-server.git
+git clone https://github.com/StannisMod/mcp-language-server.git
 cd mcp-language-server
 ```
 

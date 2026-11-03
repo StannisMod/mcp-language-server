@@ -29,34 +29,11 @@ func GetFullDefinition(ctx context.Context, client *lsp.Client, startLocation pr
 	if err != nil {
 		return "", protocol.Location{}, fmt.Errorf("failed to process document symbols: %w", err)
 	}
+	return fullDefinitionFromSymbols(startLocation, symbols)
+}
 
-	var symbolRange protocol.Range
-	found := false
-
-	// Search for symbol at startLocation
-	var searchSymbols func(symbols []protocol.DocumentSymbolResult) bool
-	searchSymbols = func(symbols []protocol.DocumentSymbolResult) bool {
-		for _, sym := range symbols {
-			if containsPosition(sym.GetRange(), startLocation.Range.Start) {
-				symbolRange = sym.GetRange()
-				found = true
-				return true
-			}
-			// Handle nested symbols if it's a DocumentSymbol
-			if ds, ok := sym.(*protocol.DocumentSymbol); ok && len(ds.Children) > 0 {
-				childSymbols := make([]protocol.DocumentSymbolResult, len(ds.Children))
-				for i := range ds.Children {
-					childSymbols[i] = &ds.Children[i]
-				}
-				if searchSymbols(childSymbols) {
-					return true
-				}
-			}
-		}
-		return false
-	}
-
-	found = searchSymbols(symbols)
+func fullDefinitionFromSymbols(startLocation protocol.Location, symbols []protocol.DocumentSymbolResult) (string, protocol.Location, error) {
+	symbolRange, found := containingSymbolRange(symbols, startLocation.Range.Start)
 
 	if found {
 		// Convert URI to filesystem path
@@ -142,12 +119,23 @@ func GetFullDefinition(ctx context.Context, client *lsp.Client, startLocation pr
 func GetLineRangesToDisplay(ctx context.Context, client *lsp.Client, locations []protocol.Location, totalLines int, contextLines int) (map[int]bool, error) {
 	// Set to track which lines need to be displayed
 	linesToShow := make(map[int]bool)
+	symbolsByURI := make(map[protocol.DocumentUri][]protocol.DocumentSymbolResult)
 
 	// For each location, get its container and add relevant lines
 	for _, loc := range locations {
-		// Use GetFullDefinition to find container
-		_, containerLoc, err := GetFullDefinition(ctx, client, loc)
-		if err != nil {
+		// One documentSymbol RPC per file, not one per diagnostic/reference.
+		symbols, loaded := symbolsByURI[loc.URI]
+		if !loaded {
+			result, err := client.DocumentSymbol(ctx, protocol.DocumentSymbolParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: loc.URI},
+			})
+			if err == nil {
+				symbols, _ = result.Results()
+			}
+			symbolsByURI[loc.URI] = symbols
+		}
+		container, found := containingSymbolRange(symbols, loc.Range.Start)
+		if !found {
 			// If container not found, just use the location's line
 			refLine := int(loc.Range.Start.Line)
 			linesToShow[refLine] = true
@@ -162,8 +150,8 @@ func GetLineRangesToDisplay(ctx context.Context, client *lsp.Client, locations [
 		}
 
 		// Add container start and end lines
-		containerStart := int(containerLoc.Range.Start.Line)
-		containerEnd := int(containerLoc.Range.End.Line)
+		containerStart := int(container.Start.Line)
+		containerEnd := int(container.End.Line)
 		linesToShow[containerStart] = true
 		// linesToShow[containerEnd] = true
 
@@ -180,4 +168,22 @@ func GetLineRangesToDisplay(ctx context.Context, client *lsp.Client, locations [
 	}
 
 	return linesToShow, nil
+}
+
+func containingSymbolRange(symbols []protocol.DocumentSymbolResult, position protocol.Position) (protocol.Range, bool) {
+	for _, sym := range symbols {
+		if containsPosition(sym.GetRange(), position) {
+			return sym.GetRange(), true
+		}
+		if ds, ok := sym.(*protocol.DocumentSymbol); ok {
+			children := make([]protocol.DocumentSymbolResult, len(ds.Children))
+			for i := range ds.Children {
+				children[i] = &ds.Children[i]
+			}
+			if found, ok := containingSymbolRange(children, position); ok {
+				return found, true
+			}
+		}
+	}
+	return protocol.Range{}, false
 }

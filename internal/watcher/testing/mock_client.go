@@ -141,6 +141,25 @@ func (m *MockLSPClient) ResetEvents() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = []FileEvent{}
+	for {
+		select {
+		case <-m.eventsReceived:
+		default:
+			return
+		}
+	}
+}
+
+// Wait for the event being asserted, not an unrelated write/create notification.
+func (m *MockLSPClient) WaitForFileEvent(ctx context.Context, uri string, kind protocol.FileChangeType) bool {
+	for {
+		if m.CountEvents(uri, kind) > 0 {
+			return true
+		}
+		if !m.WaitForEvent(ctx) {
+			return false
+		}
+	}
 }
 
 // WaitForEvent waits for at least one event to be received or context to be done

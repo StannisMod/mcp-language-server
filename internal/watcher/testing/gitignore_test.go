@@ -187,7 +187,7 @@ exact_file.txt
 		waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
 		defer waitCancel()
 
-		if !mockClient.WaitForEvent(waitCtx) {
+		if !mockClient.WaitForFileEvent(waitCtx, "file://"+filePath, protocol.FileChangeType(protocol.Created)) {
 			t.Fatal("Timed out waiting for file creation event")
 		}
 

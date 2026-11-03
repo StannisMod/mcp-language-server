@@ -44,9 +44,6 @@ func TestDiagnostics(t *testing.T) {
 		// Get a test suite with code that contains errors
 		suite := internal.GetTestSuite(t)
 
-		// Wait for diagnostics to be generated
-		time.Sleep(2 * time.Second)
-
 		ctx, cancel := context.WithTimeout(suite.Context, 5*time.Second)
 		defer cancel()
 
@@ -77,9 +74,6 @@ func TestDiagnostics(t *testing.T) {
 		// Get a test suite with clean code
 		suite := internal.GetTestSuite(t)
 
-		// Wait for initial diagnostics to be generated
-		time.Sleep(2 * time.Second)
-
 		// Create context
 		ctx, cancel := context.WithTimeout(suite.Context, 5*time.Second)
 		defer cancel()
@@ -98,10 +92,7 @@ func TestDiagnostics(t *testing.T) {
 			t.Fatalf("Failed to open consumer_clean.py: %v", err)
 		}
 
-		// Wait for files to be processed
-		time.Sleep(2 * time.Second)
-
-		// Get initial diagnostics for consumer_clean.py
+		// GetDiagnosticsForFile waits for actual completed analysis, not a sleep.
 		result, err := tools.GetDiagnosticsForFile(ctx, suite.Client, consumerPath, 2, true)
 		if err != nil {
 			t.Fatalf("GetDiagnosticsForFile failed: %v", err)
@@ -170,9 +161,6 @@ def get_items() -> List[str]:
 			t.Fatalf("Failed to send DidChangeWatchedFiles: %v", err)
 		}
 
-		// Wait for LSP to process the change
-		time.Sleep(3 * time.Second)
-
 		// Force reopen the consumer file to ensure LSP reevaluates it
 		err = suite.Client.CloseFile(ctx, consumerPath)
 		if err != nil {
@@ -183,9 +171,6 @@ def get_items() -> List[str]:
 		if err != nil {
 			t.Fatalf("Failed to reopen consumer_clean.py: %v", err)
 		}
-
-		// Wait for diagnostics to be generated
-		time.Sleep(3 * time.Second)
 
 		// Check diagnostics again on consumer file - should now have an error
 		result, err = tools.GetDiagnosticsForFile(ctx, suite.Client, consumerPath, 2, true)

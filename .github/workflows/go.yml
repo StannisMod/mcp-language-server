@@ -31,7 +31,7 @@ jobs:
         run: go install golang.org/x/tools/gopls@latest
 
       - name: Run unit tests
-        run: go test ./internal/...
+        run: go test -race ./internal/... .
 
       - name: Run code quality checks
         run: just check
@@ -78,6 +78,30 @@ jobs:
 
       - name: Run Python integration tests
         run: go test ./integrationtests/tests/python/...
+
+  python-mcp-smoke:
+    name: Python MCP smoke (Pyright ${{ matrix.pyright }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        pyright: ["1.1.390", "1.1.414"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm install -g pyright@${{ matrix.pyright }}
+      - run: go build -race -o mcp-language-server .
+      - name: Check the full MCP to Pyright path
+        run: python3 scripts/python_smoke.py --server ./mcp-language-server --lsp "$(command -v pyright-langserver)"
 
   rust-integration-tests:
     name: Rust Integration Tests

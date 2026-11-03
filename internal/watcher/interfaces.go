@@ -24,6 +24,9 @@ type LSPClient interface {
 
 // WatcherConfig holds basic configuration for the watcher
 type WatcherConfig struct {
+	// SkipAutomaticOpen lets self-indexing servers such as Pyright honor their own
+	// include/exclude configuration instead of treating all watched files as open.
+	SkipAutomaticOpen bool
 	// DebounceTime is the duration to wait before sending file change events
 	DebounceTime time.Duration
 

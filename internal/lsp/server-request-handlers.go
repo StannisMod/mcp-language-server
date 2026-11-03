@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"encoding/json"
+	"sync"
 
 	"github.com/isaacphi/mcp-language-server/internal/protocol"
 	"github.com/isaacphi/mcp-language-server/internal/utilities"
@@ -12,9 +13,12 @@ type FileWatchHandler func(id string, watchers []protocol.FileSystemWatcher)
 
 // fileWatchHandler holds the current file watch handler
 var fileWatchHandler FileWatchHandler
+var fileWatchHandlerMu sync.RWMutex
 
 // RegisterFileWatchHandler registers a handler for file watcher registrations
 func RegisterFileWatchHandler(handler FileWatchHandler) {
+	fileWatchHandlerMu.Lock()
+	defer fileWatchHandlerMu.Unlock()
 	fileWatchHandler = handler
 }
 
@@ -51,8 +55,11 @@ func HandleRegisterCapability(params json.RawMessage) (any, error) {
 			}
 
 			// Notify file watchers
-			if fileWatchHandler != nil {
-				fileWatchHandler(reg.ID, opts.Watchers)
+			fileWatchHandlerMu.RLock()
+			handler := fileWatchHandler
+			fileWatchHandlerMu.RUnlock()
+			if handler != nil {
+				handler(reg.ID, opts.Watchers)
 			}
 		}
 	}
@@ -121,8 +128,14 @@ func HandleDiagnostics(client *Client, params json.RawMessage) {
 
 	// Save diagnostics in client
 	client.diagnosticsMu.Lock()
+	defer client.diagnosticsMu.Unlock()
+	if previous, exists := client.diagnosticVersions[diagParams.URI]; exists && previous > diagParams.Version {
+		return
+	}
 	client.diagnostics[diagParams.URI] = diagParams.Diagnostics
-	client.diagnosticsMu.Unlock()
+	client.diagnosticVersions[diagParams.URI] = diagParams.Version
+	close(client.diagnosticsChanged)
+	client.diagnosticsChanged = make(chan struct{})
 
 	lspLogger.Info("Received diagnostics for %s: %d items", diagParams.URI, len(diagParams.Diagnostics))
 }

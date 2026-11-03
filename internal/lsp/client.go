@@ -17,10 +17,13 @@ import (
 )
 
 type Client struct {
-	Cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout *bufio.Reader
-	stderr io.ReadCloser
+	Cmd          *exec.Cmd
+	WorkspaceDir string
+	stdin        io.WriteCloser
+	writeMu      sync.Mutex
+	stdout       *bufio.Reader
+	stderr       io.ReadCloser
+	done         chan struct{}
 
 	// Request ID counter
 	nextID atomic.Int32
@@ -38,8 +41,12 @@ type Client struct {
 	notificationMu       sync.RWMutex
 
 	// Diagnostic cache
-	diagnostics   map[protocol.DocumentUri][]protocol.Diagnostic
-	diagnosticsMu sync.RWMutex
+	diagnostics        map[protocol.DocumentUri][]protocol.Diagnostic
+	diagnosticsMu      sync.RWMutex
+	diagnosticVersions map[protocol.DocumentUri]int32
+	diagnosticsChanged chan struct{}
+	documentVersion    atomic.Int32
+	analysisActive     bool
 
 	// Files are currently opened by the LSP
 	openFiles   map[string]*OpenFileInfo
@@ -71,10 +78,13 @@ func NewClient(command string, args ...string) (*Client, error) {
 		stdin:                 stdin,
 		stdout:                bufio.NewReader(stdout),
 		stderr:                stderr,
+		done:                  make(chan struct{}),
 		handlers:              make(map[string]chan *Message),
 		notificationHandlers:  make(map[string]NotificationHandler),
 		serverRequestHandlers: make(map[string]ServerRequestHandler),
 		diagnostics:           make(map[protocol.DocumentUri][]protocol.Diagnostic),
+		diagnosticVersions:    make(map[protocol.DocumentUri]int32),
+		diagnosticsChanged:    make(chan struct{}),
 		openFiles:             make(map[string]*OpenFileInfo),
 	}
 
@@ -114,6 +124,7 @@ func (c *Client) RegisterServerRequestHandler(method string, handler ServerReque
 }
 
 func (c *Client) InitializeLSPClient(ctx context.Context, workspaceDir string) (*protocol.InitializeResult, error) {
+	c.WorkspaceDir = workspaceDir
 	initParams := &protocol.InitializeParams{
 		WorkspaceFoldersInitializeParams: protocol.WorkspaceFoldersInitializeParams{
 			WorkspaceFolders: []protocol.WorkspaceFolder{
@@ -196,10 +207,6 @@ func (c *Client) InitializeLSPClient(ctx context.Context, workspaceDir string) (
 		return nil, fmt.Errorf("initialize failed: %w", err)
 	}
 
-	if err := c.Notify(ctx, "initialized", struct{}{}); err != nil {
-		return nil, fmt.Errorf("initialized notification failed: %w", err)
-	}
-
 	// Register handlers
 	c.RegisterServerRequestHandler("workspace/applyEdit", HandleApplyEdit)
 	c.RegisterServerRequestHandler("workspace/configuration", HandleWorkspaceConfiguration)
@@ -207,6 +214,8 @@ func (c *Client) InitializeLSPClient(ctx context.Context, workspaceDir string) (
 	c.RegisterNotificationHandler("window/showMessage", HandleServerMessage)
 	c.RegisterNotificationHandler("textDocument/publishDiagnostics",
 		func(params json.RawMessage) { HandleDiagnostics(c, params) })
+	c.RegisterNotificationHandler("pyright/beginProgress", func(json.RawMessage) { c.setAnalysisActive(true) })
+	c.RegisterNotificationHandler("pyright/endProgress", func(json.RawMessage) { c.setAnalysisActive(false) })
 
 	// Notify the LSP server
 	err := c.Initialized(ctx, protocol.InitializedParams{})
@@ -235,25 +244,13 @@ func (c *Client) Close() error {
 	// Attempt to close files but continue shutdown regardless
 	c.CloseAllFiles(ctx)
 
-	// Force kill the LSP process if it doesn't exit within timeout
-	forcedKill := make(chan struct{})
-	go func() {
-		select {
-		case <-time.After(2 * time.Second):
-			lspLogger.Warn("LSP process did not exit within timeout, forcing kill")
-			if c.Cmd.Process != nil {
-				if err := c.Cmd.Process.Kill(); err != nil {
-					lspLogger.Error("Failed to kill process: %v", err)
-				} else {
-					lspLogger.Info("Process killed successfully")
-				}
-			}
-			close(forcedKill)
-		case <-forcedKill:
-			// Channel closed from completion path
-			return
+	// Force kill without racing two goroutines to close the same channel.
+	timer := time.AfterFunc(2*time.Second, func() {
+		if c.Cmd.Process != nil {
+			_ = c.Cmd.Process.Kill()
 		}
-	}()
+	})
+	defer timer.Stop()
 
 	// Close stdin to signal the server
 	if err := c.stdin.Close(); err != nil {
@@ -261,10 +258,7 @@ func (c *Client) Close() error {
 	}
 
 	// Wait for process to exit
-	err := c.Cmd.Wait()
-	close(forcedKill) // Stop the force kill goroutine
-
-	return err
+	return c.Cmd.Wait()
 }
 
 type ServerState int
@@ -276,105 +270,34 @@ const (
 )
 
 func (c *Client) WaitForServerReady(ctx context.Context) error {
-	// TODO: wait for specific messages or poll workspace/symbol
-	time.Sleep(time.Second * 1)
-	return nil
+	// initialize has completed; subsequent requests are ordered after initialized.
+	return ctx.Err()
 }
 
 type OpenFileInfo struct {
-	Version int32
-	URI     protocol.DocumentUri
+	Version     int32
+	URI         protocol.DocumentUri
+	ContentHash [32]byte
 }
 
 func (c *Client) OpenFile(ctx context.Context, filepath string) error {
-	uri := fmt.Sprintf("file://%s", filepath)
-
-	c.openFilesMu.Lock()
-	if _, exists := c.openFiles[uri]; exists {
-		c.openFilesMu.Unlock()
-		return nil // Already open
-	}
-	c.openFilesMu.Unlock()
-
-	// Skip files that do not exist or cannot be read
-	content, err := os.ReadFile(filepath)
-	if err != nil {
-		return fmt.Errorf("error reading file: %w", err)
-	}
-
-	params := protocol.DidOpenTextDocumentParams{
-		TextDocument: protocol.TextDocumentItem{
-			URI:        protocol.DocumentUri(uri),
-			LanguageID: DetectLanguageID(uri),
-			Version:    1,
-			Text:       string(content),
-		},
-	}
-
-	if err := c.Notify(ctx, "textDocument/didOpen", params); err != nil {
-		return err
-	}
-
-	c.openFilesMu.Lock()
-	c.openFiles[uri] = &OpenFileInfo{
-		Version: 1,
-		URI:     protocol.DocumentUri(uri),
-	}
-	c.openFilesMu.Unlock()
-
-	lspLogger.Debug("Opened file: %s", filepath)
-
-	return nil
+	_, err := c.syncFile(ctx, filepath, false)
+	return err
 }
 
 func (c *Client) NotifyChange(ctx context.Context, filepath string) error {
-	uri := fmt.Sprintf("file://%s", filepath)
-
-	content, err := os.ReadFile(filepath)
-	if err != nil {
-		return fmt.Errorf("error reading file: %w", err)
-	}
-
-	c.openFilesMu.Lock()
-	fileInfo, isOpen := c.openFiles[uri]
-	if !isOpen {
-		c.openFilesMu.Unlock()
-		return fmt.Errorf("cannot notify change for unopened file: %s", filepath)
-	}
-
-	// Increment version
-	fileInfo.Version++
-	version := fileInfo.Version
-	c.openFilesMu.Unlock()
-
-	params := protocol.DidChangeTextDocumentParams{
-		TextDocument: protocol.VersionedTextDocumentIdentifier{
-			TextDocumentIdentifier: protocol.TextDocumentIdentifier{
-				URI: protocol.DocumentUri(uri),
-			},
-			Version: version,
-		},
-		ContentChanges: []protocol.TextDocumentContentChangeEvent{
-			{
-				Value: protocol.TextDocumentContentChangeWholeDocument{
-					Text: string(content),
-				},
-			},
-		},
-	}
-
-	return c.Notify(ctx, "textDocument/didChange", params)
+	_, err := c.syncFile(ctx, filepath, false)
+	return err
 }
 
 func (c *Client) CloseFile(ctx context.Context, filepath string) error {
 	uri := fmt.Sprintf("file://%s", filepath)
 
 	c.openFilesMu.Lock()
+	defer c.openFilesMu.Unlock()
 	if _, exists := c.openFiles[uri]; !exists {
-		c.openFilesMu.Unlock()
 		return nil // Already closed
 	}
-	c.openFilesMu.Unlock()
 
 	params := protocol.DidCloseTextDocumentParams{
 		TextDocument: protocol.TextDocumentIdentifier{
@@ -386,9 +309,7 @@ func (c *Client) CloseFile(ctx context.Context, filepath string) error {
 		return err
 	}
 
-	c.openFilesMu.Lock()
 	delete(c.openFiles, uri)
-	c.openFilesMu.Unlock()
 
 	return nil
 }
@@ -399,6 +320,17 @@ func (c *Client) IsFileOpen(filepath string) bool {
 	defer c.openFilesMu.RUnlock()
 	_, exists := c.openFiles[uri]
 	return exists
+}
+
+// OpenDocumentHash lets request-local symbol reuse detect intervening edits
+// without invalidating on unchanged-content diagnostic refreshes.
+func (c *Client) OpenDocumentHash(uri protocol.DocumentUri) [32]byte {
+	c.openFilesMu.RLock()
+	defer c.openFilesMu.RUnlock()
+	if info := c.openFiles[string(uri)]; info != nil {
+		return info.ContentHash
+	}
+	return [32]byte{}
 }
 
 // CloseAllFiles closes all currently open files

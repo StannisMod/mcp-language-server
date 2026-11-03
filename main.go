@@ -2,18 +2,23 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/isaacphi/mcp-language-server/internal/logging"
 	"github.com/isaacphi/mcp-language-server/internal/lsp"
+	"github.com/isaacphi/mcp-language-server/internal/mcpstdio"
 	"github.com/isaacphi/mcp-language-server/internal/watcher"
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -33,6 +38,8 @@ type mcpServer struct {
 	ctx              context.Context
 	cancelFunc       context.CancelFunc
 	workspaceWatcher *watcher.WorkspaceWatcher
+	toolMu           sync.RWMutex
+	cleanupOnce      sync.Once
 }
 
 func parseConfig() (*config, error) {
@@ -90,7 +97,14 @@ func (s *mcpServer) initializeLSP() error {
 		return fmt.Errorf("failed to create LSP client: %v", err)
 	}
 	s.lspClient = client
-	s.workspaceWatcher = watcher.NewWorkspaceWatcher(client)
+	watcherConfig := watcher.DefaultWatcherConfig()
+	watcherConfig.SkipAutomaticOpen = strings.Contains(strings.ToLower(s.config.lspCommand), "pyright")
+	if watcherConfig.SkipAutomaticOpen {
+		// Pyright already coalesces analysis. Another 300ms debounce can deliver
+		// dependency edits after a fresh target-file result has been published.
+		watcherConfig.DebounceTime = 0
+	}
+	s.workspaceWatcher = watcher.NewWorkspaceWatcherWithConfig(client, watcherConfig)
 
 	initResult, err := client.InitializeLSPClient(s.ctx, s.config.workspaceDir)
 	if err != nil {
@@ -100,7 +114,7 @@ func (s *mcpServer) initializeLSP() error {
 	coreLogger.Debug("Server capabilities: %+v", initResult.Capabilities)
 
 	go s.workspaceWatcher.WatchWorkspace(s.ctx, s.config.workspaceDir)
-	return client.WaitForServerReady(s.ctx)
+	return s.workspaceWatcher.WaitReady(s.ctx)
 }
 
 func (s *mcpServer) start() error {
@@ -113,6 +127,22 @@ func (s *mcpServer) start() error {
 		"v0.0.2",
 		server.WithLogging(),
 		server.WithRecovery(),
+		server.WithToolHandlerMiddleware(func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+			return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				switch request.Params.Name {
+				case "definition", "references", "diagnostics", "hover":
+					s.toolMu.RLock()
+					defer s.toolMu.RUnlock()
+				default:
+					s.toolMu.Lock()
+					defer s.toolMu.Unlock()
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				return next(ctx, request)
+			}
+		}),
 	)
 
 	err := s.registerTools()
@@ -120,7 +150,7 @@ func (s *mcpServer) start() error {
 		return fmt.Errorf("tool registration failed: %v", err)
 	}
 
-	return server.ServeStdio(s.mcpServer)
+	return mcpstdio.Serve(s.ctx, s.mcpServer, os.Stdin, os.Stdout, 8)
 }
 
 func main() {
@@ -179,9 +209,10 @@ func main() {
 		}
 	}()
 
-	if err := server.start(); err != nil {
+	err = server.start()
+	cleanup(server, done)
+	if err != nil && !errors.Is(err, context.Canceled) {
 		coreLogger.Error("Server error: %v", err)
-		cleanup(server, done)
 		os.Exit(1)
 	}
 
@@ -191,55 +222,58 @@ func main() {
 }
 
 func cleanup(s *mcpServer, done chan struct{}) {
-	coreLogger.Info("Cleanup initiated for PID: %d", os.Getpid())
+	s.cleanupOnce.Do(func() {
+		coreLogger.Info("Cleanup initiated for PID: %d", os.Getpid())
+		s.cancelFunc()
 
-	// Create a context with timeout for shutdown operations
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		// Create a context with timeout for shutdown operations
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	if s.lspClient != nil {
-		coreLogger.Info("Closing open files")
-		s.lspClient.CloseAllFiles(ctx)
+		if s.lspClient != nil {
+			coreLogger.Info("Closing open files")
+			s.lspClient.CloseAllFiles(ctx)
 
-		// Create a shorter timeout context for the shutdown request
-		shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		defer shutdownCancel()
+			// Create a shorter timeout context for the shutdown request
+			shutdownCtx, shutdownCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer shutdownCancel()
 
-		// Run shutdown in a goroutine with timeout to avoid blocking if LSP doesn't respond
-		shutdownDone := make(chan struct{})
-		go func() {
-			coreLogger.Info("Sending shutdown request")
-			if err := s.lspClient.Shutdown(shutdownCtx); err != nil {
-				coreLogger.Error("Shutdown request failed: %v", err)
+			// Run shutdown in a goroutine with timeout to avoid blocking if LSP doesn't respond
+			shutdownDone := make(chan struct{})
+			go func() {
+				coreLogger.Info("Sending shutdown request")
+				if err := s.lspClient.Shutdown(shutdownCtx); err != nil {
+					coreLogger.Error("Shutdown request failed: %v", err)
+				}
+				close(shutdownDone)
+			}()
+
+			// Wait for shutdown with timeout
+			select {
+			case <-shutdownDone:
+				coreLogger.Info("Shutdown request completed")
+			case <-time.After(1 * time.Second):
+				coreLogger.Warn("Shutdown request timed out, proceeding with exit")
 			}
-			close(shutdownDone)
-		}()
 
-		// Wait for shutdown with timeout
+			coreLogger.Info("Sending exit notification")
+			if err := s.lspClient.Exit(ctx); err != nil {
+				coreLogger.Error("Exit notification failed: %v", err)
+			}
+
+			coreLogger.Info("Closing LSP client")
+			if err := s.lspClient.Close(); err != nil {
+				coreLogger.Error("Failed to close LSP client: %v", err)
+			}
+		}
+
+		// Send signal to the done channel
 		select {
-		case <-shutdownDone:
-			coreLogger.Info("Shutdown request completed")
-		case <-time.After(1 * time.Second):
-			coreLogger.Warn("Shutdown request timed out, proceeding with exit")
+		case <-done: // Channel already closed
+		default:
+			close(done)
 		}
 
-		coreLogger.Info("Sending exit notification")
-		if err := s.lspClient.Exit(ctx); err != nil {
-			coreLogger.Error("Exit notification failed: %v", err)
-		}
-
-		coreLogger.Info("Closing LSP client")
-		if err := s.lspClient.Close(); err != nil {
-			coreLogger.Error("Failed to close LSP client: %v", err)
-		}
-	}
-
-	// Send signal to the done channel
-	select {
-	case <-done: // Channel already closed
-	default:
-		close(done)
-	}
-
-	coreLogger.Info("Cleanup completed for PID: %d", os.Getpid())
+		coreLogger.Info("Cleanup completed for PID: %d", os.Getpid())
+	})
 }

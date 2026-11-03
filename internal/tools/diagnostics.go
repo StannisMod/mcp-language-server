@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/isaacphi/mcp-language-server/internal/lsp"
 	"github.com/isaacphi/mcp-language-server/internal/protocol"
@@ -14,6 +14,10 @@ import (
 
 // GetDiagnosticsForFile retrieves diagnostics for a specific file from the language server
 func GetDiagnosticsForFile(ctx context.Context, client *lsp.Client, filePath string, contextLines int, showLineNumbers bool) (string, error) {
+	filePath, err := filepath.Abs(filePath)
+	if err != nil {
+		return "", err
+	}
 	// Override with environment variable if specified
 	if envLines := os.Getenv("LSP_CONTEXT_LINES"); envLines != "" {
 		if val, err := strconv.Atoi(envLines); err == nil && val >= 0 {
@@ -21,29 +25,13 @@ func GetDiagnosticsForFile(ctx context.Context, client *lsp.Client, filePath str
 		}
 	}
 
-	err := client.OpenFile(ctx, filePath)
+	diagnostics, err := client.FileDiagnostics(ctx, filePath)
 	if err != nil {
-		return "", fmt.Errorf("could not open file: %v", err)
+		return "", fmt.Errorf("could not get fresh diagnostics: %w", err)
 	}
-
-	// Wait for diagnostics
-	// TODO: wait for notification
-	time.Sleep(time.Second * 3)
 
 	// Convert the file path to URI format
 	uri := protocol.DocumentUri("file://" + filePath)
-
-	// Request fresh diagnostics
-	diagParams := protocol.DocumentDiagnosticParams{
-		TextDocument: protocol.TextDocumentIdentifier{URI: uri},
-	}
-	_, err = client.Diagnostic(ctx, diagParams)
-	if err != nil {
-		toolsLogger.Error("Failed to get diagnostics: %v", err)
-	}
-
-	// Get diagnostics from the cache
-	diagnostics := client.GetFileDiagnostics(uri)
 
 	if len(diagnostics) == 0 {
 		return "No diagnostics found for " + filePath, nil

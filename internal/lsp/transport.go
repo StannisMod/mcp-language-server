@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/isaacphi/mcp-language-server/internal/logging"
 )
@@ -96,6 +97,7 @@ func ReadMessage(r *bufio.Reader) (*Message, error) {
 
 // handleMessages reads and dispatches messages in a loop
 func (c *Client) handleMessages() {
+	defer close(c.done)
 	for {
 		msg, err := ReadMessage(c.stdout)
 		if err != nil {
@@ -150,7 +152,7 @@ func (c *Client) handleMessages() {
 			}
 
 			// Send response back to server
-			if err := WriteMessage(c.stdin, response); err != nil {
+			if err := c.writeMessage(response); err != nil {
 				lspLogger.Error("Error sending response to server: %v", err)
 			}
 
@@ -165,7 +167,8 @@ func (c *Client) handleMessages() {
 
 			if ok {
 				lspLogger.Debug("Handling notification: %s", msg.Method)
-				go handler(msg.Params)
+				// Preserve notification order (especially diagnostic versions).
+				handler(msg.Params)
 			} else {
 				lspLogger.Debug("No handler for notification: %s", msg.Method)
 			}
@@ -193,6 +196,8 @@ func (c *Client) handleMessages() {
 
 // Call makes a request and waits for the response
 func (c *Client) Call(ctx context.Context, method string, params any, result any) error {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 	id := c.nextID.Add(1)
 
 	lspLogger.Debug("Making call: method=%s id=%v", method, id)
@@ -217,14 +222,21 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 	}()
 
 	// Send request
-	if err := WriteMessage(c.stdin, msg); err != nil {
+	if err := c.writeMessage(msg); err != nil {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 
 	lspLogger.Debug("Waiting for response to request ID: %v", msg.ID)
 
 	// Wait for response
-	resp := <-ch
+	var resp *Message
+	select {
+	case resp = <-ch:
+	case <-ctx.Done():
+		return fmt.Errorf("%s: %w", method, ctx.Err())
+	case <-c.done:
+		return fmt.Errorf("%s: LSP connection closed", method)
+	}
 
 	lspLogger.Debug("Received response for request ID: %v", msg.ID)
 
@@ -258,7 +270,7 @@ func (c *Client) Notify(ctx context.Context, method string, params any) error {
 		return fmt.Errorf("failed to create notification: %w", err)
 	}
 
-	if err := WriteMessage(c.stdin, msg); err != nil {
+	if err := c.writeMessage(msg); err != nil {
 		return fmt.Errorf("failed to send notification: %w", err)
 	}
 
@@ -267,3 +279,21 @@ func (c *Client) Notify(ctx context.Context, method string, params any) error {
 
 type NotificationHandler func(params json.RawMessage)
 type ServerRequestHandler func(params json.RawMessage) (any, error)
+
+// An LSP frame's header and body must never interleave with another frame.
+func (c *Client) writeMessage(msg *Message) error {
+	return c.writeMessages(msg)
+}
+
+// Related notifications (close/reopen) must also be atomic with respect to
+// concurrent semantic requests, not just their individual frame bodies.
+func (c *Client) writeMessages(messages ...*Message) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	for _, message := range messages {
+		if err := WriteMessage(c.stdin, message); err != nil {
+			return err
+		}
+	}
+	return nil
+}

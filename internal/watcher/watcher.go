@@ -20,6 +20,7 @@ var watcherLogger = logging.NewLogger(logging.Watcher)
 
 // WorkspaceWatcher manages LSP file watching
 type WorkspaceWatcher struct {
+	ready         chan struct{}
 	client        LSPClient
 	workspacePath string
 
@@ -43,6 +44,7 @@ func NewWorkspaceWatcher(client LSPClient) *WorkspaceWatcher {
 // NewWorkspaceWatcherWithConfig creates a new workspace watcher with custom configuration
 func NewWorkspaceWatcherWithConfig(client LSPClient, config *WatcherConfig) *WorkspaceWatcher {
 	return &WorkspaceWatcher{
+		ready:         make(chan struct{}),
 		client:        client,
 		config:        config,
 		debounceMap:   make(map[string]*time.Timer),
@@ -113,6 +115,9 @@ func (w *WorkspaceWatcher) AddRegistrations(ctx context.Context, id string, watc
 
 	// Find and open all existing files that match the newly registered patterns
 	// TODO: not all language servers require this, but typescript does. Make this configurable
+	if w.skipAutomaticOpen() {
+		return
+	}
 	go func() {
 		startTime := time.Now()
 		filesOpened := 0
@@ -209,6 +214,7 @@ func (w *WorkspaceWatcher) WatchWorkspace(ctx context.Context, workspacePath str
 	if err != nil {
 		watcherLogger.Fatal("Error walking workspace: %v", err)
 	}
+	close(w.ready)
 
 	// Event loop
 	for {
@@ -254,7 +260,7 @@ func (w *WorkspaceWatcher) WatchWorkspace(ctx context.Context, workspacePath str
 						}
 					} else {
 						// For newly created files
-						if !w.shouldExcludeFile(event.Name) {
+						if !w.skipAutomaticOpen() && !w.shouldExcludeFile(event.Name) {
 							w.openMatchingFile(ctx, event.Name)
 						}
 					}
@@ -507,6 +513,10 @@ func (w *WorkspaceWatcher) matchesPattern(path string, pattern protocol.GlobPatt
 
 // debounceHandleFileEvent handles file events with debouncing to reduce notifications
 func (w *WorkspaceWatcher) debounceHandleFileEvent(ctx context.Context, uri string, changeType protocol.FileChangeType) {
+	if w.config.DebounceTime <= 0 {
+		w.handleFileEvent(ctx, uri, changeType)
+		return
+	}
 	w.debounceMu.Lock()
 	defer w.debounceMu.Unlock()
 
@@ -647,5 +657,19 @@ func (w *WorkspaceWatcher) openMatchingFile(ctx context.Context, path string) {
 		if err := w.client.OpenFile(ctx, path); err != nil && watcherLogger.IsLevelEnabled(logging.LevelDebug) {
 			watcherLogger.Debug("Error opening file %s: %v", path, err)
 		}
+	}
+}
+
+func (w *WorkspaceWatcher) skipAutomaticOpen() bool {
+	return w.config.SkipAutomaticOpen || os.Getenv("LSP_MCP_SKIP_INITIAL_OPEN") == "1"
+}
+
+// WaitReady replaces startup sleeps with an actual watcher readiness signal.
+func (w *WorkspaceWatcher) WaitReady(ctx context.Context) error {
+	select {
+	case <-w.ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

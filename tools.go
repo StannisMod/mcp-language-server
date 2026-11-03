@@ -87,7 +87,7 @@ func (s *mcpServer) registerTools() error {
 		}
 
 		coreLogger.Debug("Executing edit_file for file: %s", filePath)
-		response, err := tools.ApplyTextEdits(s.ctx, s.lspClient, filePath, edits)
+		response, err := tools.ApplyTextEdits(ctx, s.lspClient, filePath, edits)
 		if err != nil {
 			coreLogger.Error("Failed to apply edits: %v", err)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to apply edits: %v", err)), nil
@@ -111,7 +111,7 @@ func (s *mcpServer) registerTools() error {
 		}
 
 		coreLogger.Debug("Executing definition for symbol: %s", symbolName)
-		text, err := tools.ReadDefinition(s.ctx, s.lspClient, symbolName)
+		text, err := tools.ReadDefinition(ctx, s.lspClient, symbolName)
 		if err != nil {
 			coreLogger.Error("Failed to get definition: %v", err)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to get definition: %v", err)), nil
@@ -135,7 +135,7 @@ func (s *mcpServer) registerTools() error {
 		}
 
 		coreLogger.Debug("Executing references for symbol: %s", symbolName)
-		text, err := tools.FindReferences(s.ctx, s.lspClient, symbolName)
+		text, err := tools.FindReferences(ctx, s.lspClient, symbolName)
 		if err != nil {
 			coreLogger.Error("Failed to find references: %v", err)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to find references: %v", err)), nil
@@ -150,7 +150,7 @@ func (s *mcpServer) registerTools() error {
 			mcp.Description("The path to the file to get diagnostics for"),
 		),
 		mcp.WithBoolean("contextLines",
-			mcp.Description("Lines to include around each diagnostic."),
+			mcp.Description("Include surrounding code context (5 lines). False returns compact diagnostics."),
 			mcp.DefaultBool(false),
 		),
 		mcp.WithBoolean("showLineNumbers",
@@ -166,10 +166,7 @@ func (s *mcpServer) registerTools() error {
 			return mcp.NewToolResultError("filePath must be a string"), nil
 		}
 
-		contextLines := 5 // default value
-		if contextLinesArg, ok := request.Params.Arguments["contextLines"].(int); ok {
-			contextLines = contextLinesArg
-		}
+		contextLines := diagnosticContextLines(request.Params.Arguments["contextLines"])
 
 		showLineNumbers := true // default value
 		if showLineNumbersArg, ok := request.Params.Arguments["showLineNumbers"].(bool); ok {
@@ -177,7 +174,7 @@ func (s *mcpServer) registerTools() error {
 		}
 
 		coreLogger.Debug("Executing diagnostics for file: %s", filePath)
-		text, err := tools.GetDiagnosticsForFile(s.ctx, s.lspClient, filePath, contextLines, showLineNumbers)
+		text, err := tools.GetDiagnosticsForFile(ctx, s.lspClient, filePath, contextLines, showLineNumbers)
 		if err != nil {
 			coreLogger.Error("Failed to get diagnostics: %v", err)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to get diagnostics: %v", err)), nil
@@ -294,7 +291,7 @@ func (s *mcpServer) registerTools() error {
 		}
 
 		coreLogger.Debug("Executing hover for file: %s line: %d column: %d", filePath, line, column)
-		text, err := tools.GetHoverInfo(s.ctx, s.lspClient, filePath, line, column)
+		text, err := tools.GetHoverInfo(ctx, s.lspClient, filePath, line, column)
 		if err != nil {
 			coreLogger.Error("Failed to get hover information: %v", err)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to get hover information: %v", err)), nil
@@ -355,7 +352,7 @@ func (s *mcpServer) registerTools() error {
 		}
 
 		coreLogger.Debug("Executing rename_symbol for file: %s line: %d column: %d newName: %s", filePath, line, column, newName)
-		text, err := tools.RenameSymbol(s.ctx, s.lspClient, filePath, line, column, newName)
+		text, err := tools.RenameSymbol(ctx, s.lspClient, filePath, line, column, newName)
 		if err != nil {
 			coreLogger.Error("Failed to rename symbol: %v", err)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to rename symbol: %v", err)), nil
@@ -365,4 +362,22 @@ func (s *mcpServer) registerTools() error {
 
 	coreLogger.Info("Successfully registered all MCP tools")
 	return nil
+}
+
+func diagnosticContextLines(value any) int {
+	switch value := value.(type) {
+	case bool:
+		if value {
+			return 5
+		}
+	case int:
+		if value > 0 {
+			return value
+		}
+	case float64:
+		if value > 0 {
+			return int(value)
+		}
+	}
+	return 0
 }
